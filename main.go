@@ -100,21 +100,12 @@ func (c *checker) check() (errors []*npd) {
 }
 
 func (c *checker) checkInstr(instr ssa.Instruction, instrArgs map[*ssa.Parameter]ssa.Value) *npd {
-	switch instr := instr.(type) {
+	var isnil bool
+	switch instr := instr.(type) { // must match instrToNPD
 	case *ssa.FieldAddr:
 		debugf("---\t\t%s\t%#v\n", instr.X, instr.X)
-		isnil := isNil(instr.X, instrArgs)
+		isnil = isNil(instr.X, instrArgs)
 		debugln("is nil:", isnil)
-		if isnil {
-			// XXX: instr.Pos may return go/token.NoPos
-			_, path, _ := c.lprog.PathEnclosingInterval(instr.Pos(), instr.Pos())
-			sexpr := findSelectorExpr(path)
-			expr := nodeToString(sexpr.X, c.prog.Fset)
-			debugln("expr:", expr)
-			pos := c.prog.Fset.Position(instr.Pos())
-			debugln("pos:", instr.Pos().IsValid(), pos)
-			return &npd{pos, expr}
-		}
 	case *ssa.Call:
 		if instr.Call.IsInvoke() { // call to an interface method
 			return nil
@@ -138,13 +129,10 @@ func (c *checker) checkInstr(instr ssa.Instruction, instrArgs map[*ssa.Parameter
 		}
 		debugln("nilArg:", nilArg)
 		debugln("callCausesNPD:", c.callCausesNPD(callFn, args))
-		if !nilArg || !c.callCausesNPD(callFn, args) {
-			return nil
-		}
-		pos := c.prog.Fset.Position(instr.Pos())
-		_, path, _ := c.lprog.PathEnclosingInterval(instr.Pos(), instr.Pos())
-		expr := nodeToString(path[0], c.prog.Fset)
-		return &npd{pos, expr}
+		isnil = nilArg && c.callCausesNPD(callFn, args)
+	}
+	if isnil {
+		return instrToNPD(instr, c.lprog)
 	}
 	return nil
 
@@ -225,6 +213,21 @@ func findSelectorExpr(path []ast.Node) *ast.SelectorExpr {
 		}
 	}
 	return nil
+}
+
+func instrToNPD(instr ssa.Instruction, lprog *loader.Program) *npd {
+	// XXX: instr.Pos may return go/token.NoPos
+	_, path, _ := lprog.PathEnclosingInterval(instr.Pos(), instr.Pos())
+	var node ast.Node
+	switch instr.(type) { // must match checker.checkInstr
+	case *ssa.FieldAddr:
+		node = findSelectorExpr(path).X
+	default:
+		node = path[0]
+	}
+	pos := lprog.Fset.Position(instr.Pos())
+	src := nodeToString(node, lprog.Fset)
+	return &npd{pos, src}
 }
 
 func nodeToString(n interface{}, fset *token.FileSet) string {
