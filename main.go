@@ -47,11 +47,6 @@ func usage() {
 	os.Exit(2)
 }
 
-type npd struct {
-	pos  token.Position
-	expr string
-}
-
 func check(args []string) ([]*npd, error) {
 	var conf loader.Config
 	_, err := conf.FromArgs(args, false)
@@ -64,9 +59,26 @@ func check(args []string) ([]*npd, error) {
 	}
 	prog := ssautil.CreateProgram(lprog, ssa.BuilderMode(0))
 	prog.Build()
+	c := newChecker(prog, lprog)
+	return c.check(), nil
+}
 
-	var errors []*npd
-	for fn, _ := range ssautil.AllFunctions(prog) {
+type npd struct {
+	pos  token.Position
+	expr string
+}
+
+type checker struct {
+	prog  *ssa.Program
+	lprog *loader.Program
+}
+
+func newChecker(prog *ssa.Program, lprog *loader.Program) *checker {
+	return &checker{prog, lprog}
+}
+
+func (c *checker) check() (errors []*npd) {
+	for fn, _ := range ssautil.AllFunctions(c.prog) {
 		debugln(fn, fn.Signature)
 		for i, block := range fn.DomPreorder() {
 			debugf("%d:\n", i)
@@ -75,29 +87,82 @@ func check(args []string) ([]*npd, error) {
 				if v, ok := instr.(ssa.Value); ok {
 					debugf("%s = ", v.Name())
 				}
-				debugf("%s\t%#v\n", instr, instr)
-				// TODO: inspect all function calls with potentially nil arguments
-				if fieldAddr, ok := instr.(*ssa.FieldAddr); ok {
-					debugf("---\t\t%s\t%#v\n", fieldAddr.X, fieldAddr.X)
-					isnil := isNil(fieldAddr.X, nil)
-					debugln("is nil:", isnil)
-					if isnil {
-						// XXX: fieldAddr.Pos may return go/token.NoPos
-						_, path, _ := lprog.PathEnclosingInterval(fieldAddr.Pos(), fieldAddr.Pos())
-						sexpr := findSelectorExpr(path)
-						expr := nodeToString(sexpr.X, prog.Fset)
-						debugln(expr)
-						pos := prog.Fset.Position(fieldAddr.Pos())
-						debugln("pos:", fieldAddr.Pos().IsValid(), pos)
-						errors = append(errors, &npd{pos, expr})
-					}
+				if e := c.checkInstr(instr, nil); e != nil {
+					errors = append(errors, e)
 				}
+				debugf("%s\t%#v\n", instr, instr)
 			}
 		}
 		debugln()
 		debugln()
 	}
-	return errors, nil
+	return errors
+}
+
+func (c *checker) checkInstr(instr ssa.Instruction, instrArgs map[*ssa.Parameter]ssa.Value) *npd {
+	switch instr := instr.(type) {
+	case *ssa.FieldAddr:
+		debugf("---\t\t%s\t%#v\n", instr.X, instr.X)
+		isnil := isNil(instr.X, instrArgs)
+		debugln("is nil:", isnil)
+		if isnil {
+			// XXX: instr.Pos may return go/token.NoPos
+			_, path, _ := c.lprog.PathEnclosingInterval(instr.Pos(), instr.Pos())
+			sexpr := findSelectorExpr(path)
+			expr := nodeToString(sexpr.X, c.prog.Fset)
+			debugln("expr:", expr)
+			pos := c.prog.Fset.Position(instr.Pos())
+			debugln("pos:", instr.Pos().IsValid(), pos)
+			return &npd{pos, expr}
+		}
+	case *ssa.Call:
+		if instr.Call.IsInvoke() { // call to an interface method
+			return nil
+		}
+		var callFn *ssa.Function
+		var args []ssa.Value
+		switch v := instr.Call.Value.(type) {
+		case *ssa.Function:
+			callFn = v
+			args = instr.Call.Args
+		case *ssa.MakeClosure:
+			callFn = v.Fn.(*ssa.Function)
+			args = v.Bindings
+		}
+		var nilArg bool
+		for _, arg := range args {
+			if isNil(arg, instrArgs) {
+				nilArg = true
+				break
+			}
+		}
+		debugln("nilArg:", nilArg)
+		debugln("callCausesNPD:", c.callCausesNPD(callFn, args))
+		if !nilArg || !c.callCausesNPD(callFn, args) {
+			return nil
+		}
+		pos := c.prog.Fset.Position(instr.Pos())
+		_, path, _ := c.lprog.PathEnclosingInterval(instr.Pos(), instr.Pos())
+		expr := nodeToString(path[0], c.prog.Fset)
+		return &npd{pos, expr}
+	}
+	return nil
+
+}
+
+func (c *checker) callCausesNPD(fn *ssa.Function, args []ssa.Value) bool {
+	params := make(map[*ssa.Parameter]ssa.Value, len(args))
+	for i, p := range fn.Params {
+		params[p] = args[i]
+	}
+	for _, block := range fn.DomPreorder() {
+		for _, instr := range block.Instrs {
+			if e := c.checkInstr(instr, params); e != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isNil(v ssa.Value, args map[*ssa.Parameter]ssa.Value) bool {
@@ -105,18 +170,18 @@ func isNil(v ssa.Value, args map[*ssa.Parameter]ssa.Value) bool {
 	case *ssa.Alloc:
 		return v.Comment == "new"
 	case *ssa.Call:
-		if v.Call.IsInvoke() {
+		if v.Call.IsInvoke() { // call to an interface method
 			return false
 		}
 		switch call := v.Call.Value.(type) {
 		case *ssa.Builtin:
 			return false
 		case *ssa.Function:
-			return isNilCall(call, v.Call.Args)
+			return callReturnsNil(call, v.Call.Args)
 		case *ssa.MakeClosure:
-			return isNilCall(call.Fn.(*ssa.Function), call.Bindings)
+			return callReturnsNil(call.Fn.(*ssa.Function), call.Bindings)
 		default:
-			return isNil(call, nil)
+			return isNil(call, args)
 		}
 	case *ssa.Const:
 		return v.IsNil()
@@ -134,7 +199,7 @@ func isNil(v ssa.Value, args map[*ssa.Parameter]ssa.Value) bool {
 	return false
 }
 
-func isNilCall(fn *ssa.Function, args []ssa.Value) bool {
+func callReturnsNil(fn *ssa.Function, args []ssa.Value) bool {
 	params := make(map[*ssa.Parameter]ssa.Value, len(args))
 	for i, p := range fn.Params {
 		params[p] = args[i]

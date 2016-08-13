@@ -30,9 +30,9 @@ func npdInterProc() {
 //        _ = a.X
 //}
 
-//func npdNilArg() {
-//        expectNonNilParam := func(a *A) {
-//                _ = a.X // MATCH a
-//        }
-//        expectNonNilParam(nil)
-//}
+func npdNilArg() {
+	expectNonNilParam := func(a *A) {
+		_ = a.X
+	}
+	expectNonNilParam(nil) // MATCH expectNonNilParam(nil)
+}
