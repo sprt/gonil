@@ -2,26 +2,16 @@ package pkg
 
 type A struct {
 	X int
-}
-
-func ayy() {
-	a := &A{X: 5}
-	_ = a.X
+	a *A
 }
 
 func npd() {
-	var a *A
-	_ = a.X         // MATCH a
-	_ = (*A)(nil).X // MATCH (*A)(nil)
-}
-
-func noNPD() {
-	a := new(A)
-	_ = a.X
-	b := &A{}
-	_ = b.X
-	c := A{}
-	_ = c.X
+	_ = (*A)(nil).X   // MATCH (*A)(nil).X
+	_ = (*A)(nil).a.X // MATCH (*A)(nil).a
+	_ = new(A).X
+	//_ = new(A).a.X // MATCH new(A).a.X
+	_ = (&A{}).X
+	_ = A{}.X
 }
 
 func canReturnNil(ok bool) *A {
@@ -31,22 +21,26 @@ func canReturnNil(ok bool) *A {
 	return nil
 }
 
-func npdInterProc() {
+func expectNonNilParam(a *A) {
+	_ = a.X
+}
+
+func interproc() {
 	a := canReturnNil(true)
 	_ = a.X
 }
 
-func npdGuarded() {
+func guarded() {
 	a := canReturnNil(false)
+	if a != nil {
+		_ = a.X
+	}
 	if a == nil {
 		return
 	}
 	_ = a.X
 }
 
-func npdNilArg() {
-	expectNonNilParam := func(a *A) {
-		_ = a.X
-	}
+func nilArg() {
 	expectNonNilParam(nil) // MATCH expectNonNilParam(nil)
 }
