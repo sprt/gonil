@@ -6,10 +6,12 @@ type A struct {
 }
 
 func npd() {
-	_ = (*A)(nil).X   // MATCH (*A)(nil).X
+	var a *A
+	_ = a.X           // MATCH a.X
+	_ = (*A)(nil).a   // MATCH (*A)(nil).a
 	_ = (*A)(nil).a.X // MATCH (*A)(nil).a
+	_ = new(A).a.X    // MATCH new(A).a.X
 	_ = new(A).X
-	//_ = new(A).a.X // MATCH new(A).a.X
 	_ = (&A{}).X
 	_ = A{}.X
 }

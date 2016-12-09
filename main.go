@@ -116,8 +116,13 @@ func (instr *instruction) src() string {
 type trace []*instruction
 
 type value struct {
-	val  ssa.Value
-	zero bool
+	val    ssa.Value
+	zero   bool
+	toZero bool
+}
+
+func newValue(val ssa.Value, zero bool) *value {
+	return &value{val: val, zero: zero}
 }
 
 type phi []*value
@@ -127,115 +132,114 @@ type frame struct {
 	args    []ssa.Value
 	tr      trace
 	checker *checker
+	env     map[ssa.Value]phi
 }
 
 func (fr *frame) report(instr ssa.Instruction) {
 	fr.checker.report(instr, fr)
 }
 
+func (fr *frame) get(v *value) phi {
+	if edges, ok := fr.env[v.val]; ok {
+		return edges
+	}
+	return fr.symEval(v)
+}
+
 func (fr *frame) symEval(v *value) phi {
-	switch v := v.val.(type) {
+	var ret phi
+	switch val := v.val.(type) {
 	case *ssa.Alloc:
-		var zero bool
-		switch goType(v.Type()).(type) {
-		case *types.Chan, *types.Map, *types.Slice:
-			zero = true
-		}
-		return []*value{{v, zero}}
+		ret = []*value{{val, false, true}}
 	case *ssa.BinOp:
-		xx, yy := fr.symEval(&value{val: v.X}), fr.symEval(&value{val: v.Y})
-		edges := make(phi, 0, len(xx))
+		xx, yy := fr.get(&value{val: val.X}), fr.get(&value{val: val.Y})
 		for i, x := range xx {
 			y := yy[i]
-			c := ssa.NewConst(nil, v.Type())
-			switch v.Op {
+			c := ssa.NewConst(nil, val.Type())
+			switch val.Op {
 			case token.ADD, token.SUB:
-				addEdge(&edges, c, x.zero && y.zero)
+				addEdge(&ret, c, x.zero && y.zero)
 			case token.MUL:
-				addEdge(&edges, c, x.zero || y.zero)
+				addEdge(&ret, c, x.zero || y.zero)
 			case token.QUO, token.REM:
-				addEdge(&edges, c, x.zero)
+				addEdge(&ret, c, x.zero)
 
 			case token.AND, token.OR, token.XOR, token.AND_NOT:
-				addEdge(&edges, c, x.zero && y.zero)
+				addEdge(&ret, c, x.zero && y.zero)
 			case token.SHL, token.SHR:
-				addEdge(&edges, c, x.zero)
+				addEdge(&ret, c, x.zero)
 
 			case token.EQL, token.LEQ, token.GEQ:
 				switch {
 				case x.zero && y.zero:
-					edges = append(edges, &value{c, false})
+					ret = append(ret, newValue(c, false))
 				case x.zero != y.zero:
-					edges = append(edges, &value{c, true})
+					ret = append(ret, newValue(c, true))
 				default: // !x.zero && !y.zero
-					edges = append(edges, &value{c, false})
-					edges = append(edges, &value{c, true})
+					ret = append(ret, newValue(c, false))
+					ret = append(ret, newValue(c, true))
 				}
 			case token.NEQ:
 				switch {
 				case x.zero && y.zero:
-					edges = append(edges, &value{c, true})
+					ret = append(ret, newValue(c, true))
 				case x.zero != y.zero:
-					edges = append(edges, &value{c, false})
+					ret = append(ret, newValue(c, false))
 				default: // !x.zero && !y.zero
-					edges = append(edges, &value{c, false})
-					edges = append(edges, &value{c, true})
+					ret = append(ret, newValue(c, false))
+					ret = append(ret, newValue(c, true))
 				}
 			case token.LSS, token.GTR:
 				// TODO: we can be more accurate here;
 				// strings come to mind.
-				edges = append(edges, &value{c, false})
-				edges = append(edges, &value{c, true})
+				ret = append(ret, newValue(c, false))
+				ret = append(ret, newValue(c, true))
 			}
 		}
-		return edges
 	case *ssa.Call:
-		return fr.symEvalCall(v, 0)
+		ret = fr.symEvalCall(val, 0)
 	case *ssa.Const:
-		if v.IsNil() {
-			return []*value{{v, true}}
+		if val.IsNil() {
+			ret = []*value{newValue(val, true)}
+			break
 		}
 		var zero bool
-		switch v.Value.Kind() {
+		switch val.Value.Kind() {
 		case constant.Bool:
-			zero = !constant.BoolVal(v.Value)
+			zero = !constant.BoolVal(val.Value)
 		case constant.Complex:
-			zero = v.Complex128() == 0
+			zero = val.Complex128() == 0
 		case constant.Float:
-			zero = v.Float64() == 0
+			zero = val.Float64() == 0
 		case constant.Int:
-			zero = v.Uint64() == 0
+			zero = val.Uint64() == 0
 		case constant.String:
-			zero = constant.StringVal(v.Value) == ""
+			zero = constant.StringVal(val.Value) == ""
 		}
-		return []*value{{zero: zero}}
+		ret = []*value{{zero: zero}}
 	case *ssa.Extract:
-		return fr.symEvalExtract(v)
+		ret = fr.symEvalExtract(val)
 	case *ssa.FieldAddr:
-		xx := fr.symEval(&value{val: v.X})
+		xx := fr.get(&value{val: val.X})
 		if xx == nil {
 			return nil
 		}
-		edges := make(phi, 0, 2*len(xx))
 		for _, x := range xx {
-			if _, ok := x.val.(*ssa.Const); /*x.zero ||*/ ok {
-				// Constant *struct is always (*struct)(nil)
-				fr.report(v)
-				break
+			if x.zero {
+				fr.report(val)
+				continue
 			}
-			field := goType(x.val.Type()).(*types.Struct).Field(v.Field)
-			c := ssa.NewConst(nil, named(field.Type()))
-			edges = append(edges, &value{c, true})
-			if !x.zero {
-				edges = append(edges, &value{c, false})
+			c := ssa.NewConst(nil, val.Type())
+			ret = append(ret, &value{val: c, toZero: true})
+			if !x.toZero {
+				ret = append(ret, &value{val: c, toZero: false})
 			}
 		}
-		return edges
 	case *ssa.Global:
 		return nil
 	case *ssa.Lookup:
 		// val.CommaOk == false
-		xx := fr.symEval(&value{val: v.X})
+		xx := fr.get(&value{val: val.X})
 		if xx == nil {
 			return nil
 		}
@@ -244,15 +248,13 @@ func (fr *frame) symEval(v *value) phi {
 			// (guaranteed if x.zero)
 			return nil
 		}
-		edges := make(phi, 0, len(xx))
 		for _, x := range xx {
 			c := ssa.NewConst(nil, x.val.Type().(*types.Map).Elem())
-			edges = append(edges, &value{c, true})
+			ret = append(ret, newValue(c, true))
 			if !x.zero {
-				edges = append(edges, &value{c, false})
+				ret = append(ret, newValue(c, false))
 			}
 		}
-		return edges
 	case *ssa.Next, *ssa.TypeAssert:
 		panic("unreachable") // handled by symEvalExtract
 	case *ssa.Parameter:
@@ -261,18 +263,36 @@ func (fr *frame) symEval(v *value) phi {
 		}
 		var arg ssa.Value
 		for i, p := range fr.fn.Params {
-			if p == v {
+			if p == val {
 				arg = fr.args[i]
 				break
 			}
 		}
-		return fr.symEval(&value{val: arg})
-	//case *ssa.UnOp:
-	//        // FIXME
-	//        return fr.symEval(&value{val: v.X})
-	default:
-		return nil
+		ret = fr.get(&value{val: arg})
+	case *ssa.UnOp:
+		xx := fr.get(&value{val: val.X})
+		if xx == nil {
+			return nil
+		}
+		switch val.Op {
+		case token.MUL:
+			for _, x := range xx {
+				if x.zero {
+					fr.report(val)
+					continue
+				}
+				c := ssa.NewConst(nil, val.Type())
+				ret = append(ret, &value{val: c, zero: true})
+				if !x.toZero {
+					ret = append(ret, &value{val: c, zero: true})
+				}
+			}
+		default:
+			return nil // TODO
+		}
 	}
+	fr.env[v.val] = ret
+	return ret
 }
 
 func (fr *frame) symEvalExtract(t *ssa.Extract) phi {
@@ -292,13 +312,13 @@ func (fr *frame) symEvalExtract(t *ssa.Extract) phi {
 			var typ types.Type
 			if t.Index == 0 { // x[k]
 				typ = x.val.Type().(*types.Map).Elem()
-				edges = append(edges, &value{ssa.NewConst(nil, typ), true})
+				edges = append(edges, newValue(ssa.NewConst(nil, typ), true))
 			} else { // ,ok
 				typ = types.Typ[types.Bool]
-				edges = append(edges, &value{ssa.NewConst(nil, typ), true})
+				edges = append(edges, newValue(ssa.NewConst(nil, typ), true))
 			}
 			if !x.zero {
-				edges = append(edges, &value{ssa.NewConst(nil, typ), false})
+				edges = append(edges, newValue(ssa.NewConst(nil, typ), false))
 			}
 		}
 		return edges
@@ -330,7 +350,7 @@ func (fr *frame) symEvalFunc(call ssa.CallInstruction, fn *ssa.Function, args []
 	if call != nil {
 		tr = append(tr, &instruction{call, fr.checker.lprog})
 	}
-	newfr := &frame{fn, args, tr, fr.checker}
+	newfr := &frame{fn, args, tr, fr.checker, make(map[ssa.Value]phi)}
 	return newfr.symEvalBlock(fn.Blocks[0], res)
 }
 
@@ -411,9 +431,9 @@ func (fr *frame) symEvalBlock(block *ssa.BasicBlock, res int) phi {
 
 func addEdge(edges *phi, v ssa.Value, guaranteedZero bool) {
 	if !guaranteedZero {
-		*edges = append(*edges, &value{v, false})
+		*edges = append(*edges, newValue(v, false))
 	}
-	*edges = append(*edges, &value{v, true})
+	*edges = append(*edges, newValue(v, true))
 }
 
 func named(typ types.Type) types.Type {
