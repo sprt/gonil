@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"reflect"
 
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
@@ -133,6 +134,7 @@ type frame struct {
 	tr      trace
 	checker *checker
 	env     map[ssa.Value]phi
+	lvl     int
 }
 
 func (fr *frame) report(instr ssa.Instruction) {
@@ -150,7 +152,7 @@ func (fr *frame) symEval(v *value) phi {
 	var ret phi
 	switch val := v.val.(type) {
 	case *ssa.Alloc:
-		ret = []*value{{val, false, true}}
+		ret = []*value{{val: val, zero: false, toZero: true}}
 	case *ssa.BinOp:
 		xx, yy := fr.get(&value{val: val.X}), fr.get(&value{val: val.Y})
 		for i, x := range xx {
@@ -350,23 +352,26 @@ func (fr *frame) symEvalFunc(call ssa.CallInstruction, fn *ssa.Function, args []
 	if call != nil {
 		tr = append(tr, &instruction{call, fr.checker.lprog})
 	}
-	newfr := &frame{fn, args, tr, fr.checker, make(map[ssa.Value]phi)}
-	return newfr.symEvalBlock(fn.Blocks[0], res)
+	if debug {
+		fmt.Printf("func %s:\n", fn.Name())
+	}
+	newfr := &frame{fn, args, tr, fr.checker, make(map[ssa.Value]phi), fr.lvl + 1}
+	eval := newfr.symEvalBlock(fn.Blocks[0], res)
+	if debug {
+		fmt.Println()
+	}
+	return eval
 }
 
 func (fr *frame) symEvalBlock(block *ssa.BasicBlock, res int) phi {
 	if len(block.Instrs) == 0 {
 		return nil // block is unreachable
 	}
+	fr.debugf("%d:\n", block.Index)
 	for _, instr := range block.Instrs {
-		//log.Printf("\t; %#v", instr)
-		//var pre string
-		//var edges phi
+		var val ssa.Value
 		if v, ok := instr.(ssa.Value); ok {
-			if debug {
-				//pre = v.Name() + " = "
-				//edges = fr.symEval(&value{val: v})
-			}
+			val = v
 			switch v := v.(type) {
 			case *ssa.FieldAddr:
 				_ = fr.symEval(&value{val: v})
@@ -387,11 +392,23 @@ func (fr *frame) symEvalBlock(block *ssa.BasicBlock, res int) phi {
 				}
 			}
 		}
-		//for i, val := range edges {
-		//        log.Printf("\t; %d=%#v", i, val)
-		//}
-		//log.Print("\t", pre, instr)
-		//log.Print("\n")
+		fr.debugf("\t; %s\n", reflect.TypeOf(instr))
+		if val != nil {
+			edges := fr.symEval(&value{val: val})
+			var edge *value
+			if len(edges) != 0 {
+				edge = edges[0]
+				fr.debugf("\t; val:%v zero:%v toZero:%v\n", edge.val, edge.zero, edge.toZero)
+			} else {
+				fr.debugf("\t; couldn't eval\n")
+			}
+		}
+		fr.debugf("\t")
+		if val != nil {
+			fr.debugf("%s = ", val.Name())
+		}
+		fr.debugf("%s\n", instr)
+		fr.debugf("\n")
 	}
 	switch ctrl := block.Instrs[len(block.Instrs)-1].(type) {
 	case *ssa.If:
@@ -426,6 +443,12 @@ func (fr *frame) symEvalBlock(block *ssa.BasicBlock, res int) phi {
 		return fr.symEval(&value{val: ctrl.Results[res]})
 	default:
 		panic("unreachable")
+	}
+}
+
+func (fr *frame) debugf(format string, a ...interface{}) {
+	if debug && fr.lvl == 1 {
+		fmt.Printf(format, a...)
 	}
 }
 
